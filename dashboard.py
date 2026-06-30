@@ -239,13 +239,9 @@ def webhook():
     def deploy():
         base = os.path.dirname(os.path.abspath(__file__))
         subprocess.run(
-            ["git", "remote", "set-url", "origin", "https://github.com/trinityprog/hh-vacantica.git"],
-            cwd=base,
-        )
-        subprocess.run(
             ["git", "pull", "origin", "master"],
             cwd=base,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o StrictHostKeyChecking=no"},
         )
         venv_pip = os.path.join(base, "venv", "bin", "pip")
         if os.path.exists(venv_pip):
