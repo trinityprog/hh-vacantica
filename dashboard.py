@@ -1,12 +1,17 @@
+import hashlib
+import hmac
 import os
 import sqlite3
+import subprocess
 import threading
 from datetime import datetime
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, abort
 
 import config
 import database
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 app = Flask(__name__)
 
@@ -208,6 +213,47 @@ def api_data():
         "log": log_lines,
         "last_response": last_response,
     })
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if not WEBHOOK_SECRET:
+        abort(503, "WEBHOOK_SECRET не задан")
+
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    expected = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(), request.data, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        abort(403)
+
+    event = request.headers.get("X-GitHub-Event", "")
+    if event != "push":
+        return jsonify({"status": "ignored"})
+
+    payload = request.json or {}
+    ref = payload.get("ref", "")
+    if ref != "refs/heads/master":
+        return jsonify({"status": "ignored", "ref": ref})
+
+    def deploy():
+        base = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", "https://github.com/trinityprog/hh-vacantica.git"],
+            cwd=base,
+        )
+        subprocess.run(
+            ["git", "pull", "origin", "master"],
+            cwd=base,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        venv_pip = os.path.join(base, "venv", "bin", "pip")
+        if os.path.exists(venv_pip):
+            subprocess.run([venv_pip, "install", "-r", "requirements.txt", "-q"], cwd=base)
+        subprocess.run(["systemctl", "restart", "hh-vacantica"])
+
+    threading.Thread(target=deploy, daemon=True).start()
+    return jsonify({"status": "deploying"})
 
 
 def start_dashboard(port: int = 8080):

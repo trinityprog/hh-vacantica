@@ -8,18 +8,19 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: 22
-          script: |
-            cd /srv/hh-vacantica
-            git remote set-url origin https://github.com/trinityprog/hh-vacantica.git
-            GIT_TERMINAL_PROMPT=0 git pull origin master
-            source venv/bin/activate 
-            pip install -r requirements.txt -q
-            systemctl restart hh-vacantica
-            systemctl status hh-vacantica --no-pager
+      - name: Trigger webhook deploy
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          PAYLOAD='{"ref":"refs/heads/master"}'
+          SIG="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: push" \
+            -H "X-Hub-Signature-256: $SIG" \
+            -d "$PAYLOAD" \
+            "http://$VPS_HOST:8888/webhook")
+          echo "Response: $HTTP_CODE"
+          [ "$HTTP_CODE" = "200" ] || exit 1
