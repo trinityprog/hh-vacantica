@@ -6,6 +6,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 # --- Авторизация ---
 HH_LOGIN = os.getenv("HH_LOGIN", "")
 HH_PASSWORD = os.getenv("HH_PASSWORD", "")
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
 # --- Резюме ---
 RESUME_TITLE = os.getenv("RESUME_TITLE", "Python разработчик")

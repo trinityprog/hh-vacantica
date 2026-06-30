@@ -43,7 +43,7 @@ async def load_session() -> tuple[Browser, BrowserContext]:
     if _playwright is None:
         await start_playwright()
 
-    _browser = await _playwright.chromium.launch(headless=False)
+    _browser = await _playwright.chromium.launch(headless=config.HEADLESS)
 
     if os.path.exists(config.SESSION_PATH):
         logger.info("Загружаю сохранённую сессию")
