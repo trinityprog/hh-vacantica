@@ -142,8 +142,8 @@ async def run_scheduler():
     stats = database.get_stats()
     logger.info(f"База данных: {stats}")
 
-    dashboard.start_dashboard(port=8080)
-    logger.info("Дашборд запущен: http://0.0.0.0:8080")
+    dashboard.start_dashboard(port=8888)
+    logger.info("Дашборд запущен: http://0.0.0.0:8888")
 
     await setup_scheduler()
 
