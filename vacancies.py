@@ -65,7 +65,7 @@ async def _search_vacancies(page) -> list[dict]:
 
     url = "https://hh.ru/search/vacancy?" + urllib.parse.urlencode(params)
 
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2000)
     await human_delay.scroll_naturally(page)
 
@@ -179,8 +179,11 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
     context = page.context
     new_tab = await context.new_page()
     try:
-        await new_tab.goto(vacancy["vacancy_url"], wait_until="domcontentloaded", timeout=30000)
-        await new_tab.wait_for_timeout(1500)
+        # Чистый URL без tracking-параметров
+        clean_url = vacancy["vacancy_url"].split("?")[0]
+
+        await new_tab.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
+        await new_tab.wait_for_timeout(2000)
         await human_delay.scroll_naturally(new_tab)
 
         # Нажать кнопку "Откликнуться"
@@ -190,10 +193,10 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
         if not respond_btn:
             respond_btn = await new_tab.query_selector("a[data-qa*='response']")
         if not respond_btn:
-            logger.debug(f"Кнопка отклика не найдена: {vacancy['vacancy_url']}")
+            logger.debug(f"Кнопка отклика не найдена: {clean_url}")
             return False
 
-        await respond_btn.click()
+        await respond_btn.click(force=True, timeout=60000)
         await new_tab.wait_for_timeout(2000)
 
         # Если появилось поле сопроводительного письма
@@ -204,7 +207,7 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
             cover_input = await new_tab.query_selector("textarea[placeholder*='письм']")
 
         if cover_input:
-            await cover_input.click()
+            await cover_input.click(force=True)
             for char in config.COVER_LETTER_TEMPLATE:
                 await cover_input.type(char, delay=random_char_delay())
             await asyncio.sleep(0.5)
@@ -216,7 +219,7 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
         if not submit_btn:
             submit_btn = await new_tab.query_selector("button:has-text('Отправить')")
         if submit_btn:
-            await submit_btn.click()
+            await submit_btn.click(force=True, timeout=60000)
             await new_tab.wait_for_timeout(2000)
 
         # Проверить подтверждение
