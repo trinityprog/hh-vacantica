@@ -1,0 +1,7 @@
+.env
+session/state.json
+*.db
+logs/*.log
+logs/screenshots/
+__pycache__/
+*.pyc
