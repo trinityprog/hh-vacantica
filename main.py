@@ -8,6 +8,7 @@ import pytz
 
 import browser
 import config
+import dashboard
 import database
 import resume
 import vacancies
@@ -140,6 +141,9 @@ async def run_scheduler():
     logger.info("Авторизация подтверждена.")
     stats = database.get_stats()
     logger.info(f"База данных: {stats}")
+
+    dashboard.start_dashboard(port=8080)
+    logger.info("Дашборд запущен: http://0.0.0.0:8080")
 
     await setup_scheduler()
 
