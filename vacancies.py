@@ -199,6 +199,15 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
         await respond_btn.click(force=True, timeout=60000)
         await new_tab.wait_for_timeout(2000)
 
+        # Модалка "Вы откликаетесь на вакансию в другой стране"
+        cross_country_btn = await new_tab.query_selector("[data-qa='relocation-warning-confirm']")
+        if not cross_country_btn:
+            cross_country_btn = await new_tab.query_selector("button:has-text('Все равно откликнуться')")
+        if cross_country_btn:
+            logger.debug("Модалка 'другая страна' — подтверждаем")
+            await cross_country_btn.click(force=True)
+            await new_tab.wait_for_timeout(1500)
+
         # Если появилось поле сопроводительного письма
         cover_input = await new_tab.query_selector("[data-qa='vacancy-response-popup-form-letter-input']")
         if not cover_input:
