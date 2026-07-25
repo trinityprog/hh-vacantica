@@ -1,10 +1,8 @@
 import hashlib
 import hmac
 import os
-import sqlite3
 import subprocess
 import threading
-from datetime import datetime
 
 from flask import Flask, jsonify, request, abort
 
@@ -23,6 +21,7 @@ HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HH Vacantica</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0f1117; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
@@ -61,6 +60,14 @@ HTML = """<!DOCTYPE html>
   .salary { color: #22c55e; font-size: 12px; }
   .time   { color: #475569; font-size: 11px; }
   .empty  { padding: 24px; text-align: center; color: #475569; font-size: 13px; }
+  .panel-toolbar { padding: 10px 18px; border-bottom: 1px solid #2d3148; }
+  .panel-search { width: 100%; background: #0d1117; border: 1px solid #2d3148; border-radius: 8px; color: #e2e8f0; padding: 7px 10px; font-size: 12.5px; outline: none; }
+  .panel-search:focus { border-color: #3b82f6; }
+  .panel-search::placeholder { color: #475569; }
+  .pager { display: flex; align-items: center; justify-content: space-between; padding: 8px 18px; border-top: 1px solid #1e2235; font-size: 12px; color: #64748b; }
+  .pager button { background: #1e2235; border: 1px solid #2d3148; color: #cbd5e1; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  .pager button:disabled { opacity: .4; cursor: default; }
+  .pager button:not(:disabled):hover { background: #2d3148; }
 </style>
 </head>
 <body>
@@ -75,13 +82,23 @@ HTML = """<!DOCTYPE html>
   <div class="cards" id="cards"></div>
   <div class="grid2">
     <div class="panel">
-      <div class="panel-header">Последние отклики</div>
+      <div class="panel-header">Отклики</div>
+      <div class="panel-toolbar"><input class="panel-search" id="responses-search" placeholder="Поиск по вакансии/компании…"></div>
       <div id="responses-table"></div>
+      <div class="pager" id="responses-pager"></div>
     </div>
     <div class="panel">
       <div class="panel-header">Поднятия резюме</div>
+      <div class="panel-toolbar"><input class="panel-search" id="publishes-search" placeholder="Поиск по сообщению…"></div>
       <div id="publishes-table"></div>
+      <div class="pager" id="publishes-pager"></div>
     </div>
+  </div>
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-header">На ручную обработку</div>
+    <div class="panel-toolbar"><input class="panel-search" id="manual-search" placeholder="Поиск по вакансии/компании/причине…"></div>
+    <div id="manual-review-table"></div>
+    <div class="pager" id="manual-pager"></div>
   </div>
   <div class="log-panel">
     <div class="panel-header">Лог</div>
@@ -99,14 +116,102 @@ function classForLevel(line) {
   return 'log-INFO';
 }
 
+function toLocalDate(dt) {
+  return new Date(dt.replace(' ', 'T') + 'Z');
+}
+
 function timeAgo(dt) {
-  const d = new Date(dt.replace(' ', 'T') + 'Z');
+  const d = toLocalDate(dt);
   const s = Math.floor((Date.now() - d) / 1000);
   if (s < 60) return s + 'с назад';
   if (s < 3600) return Math.floor(s/60) + 'м назад';
   if (s < 86400) return Math.floor(s/3600) + 'ч назад';
   return Math.floor(s/86400) + 'д назад';
 }
+
+function formatLocal(dt) {
+  const d = toLocalDate(dt);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}.${pad(d.getMonth()+1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// --- Списки с поиском и пагинацией ---
+const panels = {
+  responses: { page: 1, q: '', endpoint: '/api/responses' },
+  publishes: { page: 1, q: '', endpoint: '/api/publishes' },
+  manual:    { page: 1, q: '', endpoint: '/api/manual_review' },
+};
+const tableIds = { responses: 'responses-table', publishes: 'publishes-table', manual: 'manual-review-table' };
+const pagerIds = { responses: 'responses-pager', publishes: 'publishes-pager', manual: 'manual-pager' };
+
+function renderResponses(rows) {
+  if (rows.length === 0) return '<div class="empty">Ничего не найдено</div>';
+  const trs = rows.map(r => `
+    <tr>
+      <td><a href="${r.vacancy_url}" target="_blank">${r.vacancy_title}</a><br><span class="time">${r.company_name}</span></td>
+      <td><span class="salary">${r.salary_text || '—'}</span><br><span class="time">${timeAgo(r.responded_at)}</span></td>
+    </tr>`).join('');
+  return `<table><thead><tr><th>Вакансия</th><th>Зарплата</th></tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+function renderPublishes(rows) {
+  if (rows.length === 0) return '<div class="empty">Ничего не найдено</div>';
+  const trs = rows.map(p => `
+    <tr>
+      <td class="${p.success ? 'ok' : 'err'}">${p.success ? '✅' : '❌'}</td>
+      <td style="font-size:12px">${p.message}</td>
+      <td><span class="time">${timeAgo(p.published_at)}</span></td>
+    </tr>`).join('');
+  return `<table><thead><tr><th></th><th>Сообщение</th><th>Время</th></tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+function renderManual(rows) {
+  if (rows.length === 0) return '<div class="empty">Ничего не найдено</div>';
+  const trs = rows.map(m => `
+    <tr>
+      <td><a href="${m.vacancy_url}" target="_blank">${m.vacancy_title}</a><br><span class="time">${m.company_name}</span></td>
+      <td style="font-size:12px">${m.reason}</td>
+      <td><span class="time">${timeAgo(m.created_at)}</span></td>
+    </tr>`).join('');
+  return `<table><thead><tr><th>Вакансия</th><th>Причина</th><th>Время</th></tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+const renderers = { responses: renderResponses, publishes: renderPublishes, manual: renderManual };
+
+async function loadPanel(name) {
+  const st = panels[name];
+  const url = `${st.endpoint}?q=${encodeURIComponent(st.q)}&page=${st.page}`;
+  const data = await fetch(url).then(r => r.json());
+  const pages = Math.max(1, Math.ceil(data.total / data.page_size));
+  if (st.page > pages) { st.page = pages; return loadPanel(name); }
+  document.getElementById(tableIds[name]).innerHTML = renderers[name](data.rows);
+  document.getElementById(pagerIds[name]).innerHTML = `
+    <span>${data.total} записей · стр. ${st.page}/${pages}</span>
+    <div>
+      <button ${st.page <= 1 ? 'disabled' : ''} onclick="panelPage('${name}', -1)">← Назад</button>
+      <button ${st.page >= pages ? 'disabled' : ''} onclick="panelPage('${name}', 1)">Вперёд →</button>
+    </div>`;
+}
+
+function panelPage(name, delta) {
+  panels[name].page += delta;
+  loadPanel(name);
+}
+
+const searchTimers = {};
+function wireSearch(name, inputId) {
+  document.getElementById(inputId).addEventListener('input', (e) => {
+    clearTimeout(searchTimers[name]);
+    searchTimers[name] = setTimeout(() => {
+      panels[name].q = e.target.value;
+      panels[name].page = 1;
+      loadPanel(name);
+    }, 300);
+  });
+}
+wireSearch('responses', 'responses-search');
+wireSearch('publishes', 'publishes-search');
+wireSearch('manual', 'manual-search');
 
 async function load() {
   const data = await fetch('/api/data').then(r => r.json());
@@ -116,38 +221,16 @@ async function load() {
     <div class="card"><div class="card-label">Всего откликов</div><div class="card-value blue">${data.stats.total_responses}</div></div>
     <div class="card"><div class="card-label">Сегодня откликов</div><div class="card-value green">${data.stats.today_responses}</div></div>
     <div class="card"><div class="card-label">Поднятий резюме</div><div class="card-value amber">${data.stats.total_publishes}</div></div>
-    <div class="card"><div class="card-label">Последний отклик</div><div class="card-value" style="font-size:16px;padding-top:6px">${data.last_response || '—'}</div></div>
+    <div class="card"><div class="card-label">На ручную обработку</div><div class="card-value" style="color:#f472b6">${data.stats.manual_review_count}</div></div>
+    <div class="card"><div class="card-label">Последний отклик</div><div class="card-value" style="font-size:16px;padding-top:6px">${data.last_response ? formatLocal(data.last_response) : '—'}</div></div>
   `;
-
-  // Responses
-  if (data.responses.length === 0) {
-    document.getElementById('responses-table').innerHTML = '<div class="empty">Откликов ещё нет</div>';
-  } else {
-    let rows = data.responses.map(r => `
-      <tr>
-        <td><a href="${r.vacancy_url}" target="_blank">${r.vacancy_title}</a><br><span class="time">${r.company_name}</span></td>
-        <td><span class="salary">${r.salary_text || '—'}</span><br><span class="time">${timeAgo(r.responded_at)}</span></td>
-      </tr>`).join('');
-    document.getElementById('responses-table').innerHTML = `<table><thead><tr><th>Вакансия</th><th>Зарплата</th></tr></thead><tbody>${rows}</tbody></table>`;
-  }
-
-  // Publishes
-  if (data.publishes.length === 0) {
-    document.getElementById('publishes-table').innerHTML = '<div class="empty">Поднятий ещё нет</div>';
-  } else {
-    let rows = data.publishes.map(p => `
-      <tr>
-        <td class="${p.success ? 'ok' : 'err'}">${p.success ? '✅' : '❌'}</td>
-        <td style="font-size:12px">${p.message}</td>
-        <td><span class="time">${timeAgo(p.published_at)}</span></td>
-      </tr>`).join('');
-    document.getElementById('publishes-table').innerHTML = `<table><thead><tr><th></th><th>Сообщение</th><th>Время</th></tr></thead><tbody>${rows}</tbody></table>`;
-  }
 
   // Log
   const logEl = document.getElementById('log');
   logEl.innerHTML = data.log.map(l => `<div class="log-line ${classForLevel(l)}">${l}</div>`).join('');
   logEl.scrollTop = logEl.scrollHeight;
+
+  await Promise.all([loadPanel('responses'), loadPanel('publishes'), loadPanel('manual')]);
 }
 
 async function tick() {
@@ -176,27 +259,10 @@ def index():
 def api_data():
     stats = database.get_stats()
 
-    with sqlite3.connect(database.DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-
-        responses = [dict(r) for r in conn.execute(
-            "SELECT vacancy_title, company_name, vacancy_url, salary_text, responded_at "
-            "FROM responses ORDER BY responded_at DESC LIMIT 20"
-        ).fetchall()]
-
-        publishes = [dict(r) for r in conn.execute(
-            "SELECT success, message, published_at "
-            "FROM resume_publishes ORDER BY published_at DESC LIMIT 20"
-        ).fetchall()]
-
-    last_response = None
-    if responses:
-        ts = responses[0]["responded_at"]
-        try:
-            dt = datetime.fromisoformat(ts)
-            last_response = dt.strftime("%d.%m %H:%M")
-        except Exception:
-            last_response = ts
+    # responded_at хранится в SQLite как UTC (CURRENT_TIMESTAMP) — форматируем
+    # в локальное время на фронтенде (см. timeAgo/formatLocal в JS), а не тут
+    last_rows, _ = database.get_responses(page=1, page_size=1)
+    last_response = last_rows[0]["responded_at"] if last_rows else None
 
     log_lines = []
     try:
@@ -208,11 +274,36 @@ def api_data():
 
     return jsonify({
         "stats": stats,
-        "responses": responses,
-        "publishes": publishes,
         "log": log_lines,
         "last_response": last_response,
     })
+
+
+PAGE_SIZE = 15
+
+
+@app.route("/api/responses")
+def api_responses():
+    q = request.args.get("q", "").strip()
+    page = request.args.get("page", 1, type=int)
+    rows, total = database.get_responses(q, page, PAGE_SIZE)
+    return jsonify({"rows": rows, "total": total, "page": page, "page_size": PAGE_SIZE})
+
+
+@app.route("/api/publishes")
+def api_publishes():
+    q = request.args.get("q", "").strip()
+    page = request.args.get("page", 1, type=int)
+    rows, total = database.get_publishes(q, page, PAGE_SIZE)
+    return jsonify({"rows": rows, "total": total, "page": page, "page_size": PAGE_SIZE})
+
+
+@app.route("/api/manual_review")
+def api_manual_review():
+    q = request.args.get("q", "").strip()
+    page = request.args.get("page", 1, type=int)
+    rows, total = database.get_manual_review(q, page, PAGE_SIZE)
+    return jsonify({"rows": rows, "total": total, "page": page, "page_size": PAGE_SIZE})
 
 
 @app.route("/webhook", methods=["POST"])

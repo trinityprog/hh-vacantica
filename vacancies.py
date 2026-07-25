@@ -13,8 +13,21 @@ async def run_responses(page) -> dict:
     Найти вакансии и откликнуться на подходящие.
     Возвращает {"sent": int, "skipped": int, "errors": int}
     """
-    stats = {"sent": 0, "skipped": 0, "errors": 0}
-    logger.info("Запуск задачи: отклики на вакансии")
+    stats = {"sent": 0, "skipped": 0, "manual": 0, "errors": 0}
+
+    is_limited, blocked_until = database.get_rate_limit_status()
+    if is_limited:
+        logger.info(f"hh.ru лимит откликов активен до {blocked_until} UTC — пропускаю прогон")
+        return stats
+
+    today_count = database.count_today_responses()
+    if today_count >= config.DAILY_RESPONSE_CAP:
+        logger.info(
+            f"Дневной лимит откликов hh.ru достигнут ({today_count}/{config.DAILY_RESPONSE_CAP}) — жду завтра"
+        )
+        return stats
+
+    logger.info(f"Запуск задачи: отклики на вакансии ({today_count}/{config.DAILY_RESPONSE_CAP} за сегодня)")
 
     try:
         vacancies = await _search_vacancies(page)
@@ -35,8 +48,13 @@ async def run_responses(page) -> dict:
                 stats["skipped"] += 1
                 continue
 
-            success = await _respond_to_vacancy(page, vacancy)
-            if success:
+            if database.is_in_manual_review(vacancy["vacancy_id"]):
+                logger.warning(f"⏭  Пропуск (в списке на ручную обработку): \"{vacancy['vacancy_title']}\" — {vacancy['company_name']}")
+                stats["skipped"] += 1
+                continue
+
+            result, reason = await _respond_to_vacancy(page, vacancy)
+            if result == "sent":
                 database.save_response(vacancy)
                 logger.info(f"✅ Отклик: \"{vacancy['vacancy_title']}\" — {vacancy['company_name']}")
                 stats["sent"] += 1
@@ -44,6 +62,14 @@ async def run_responses(page) -> dict:
                     config.MIN_DELAY_BETWEEN_RESPONSES,
                     config.MAX_DELAY_BETWEEN_RESPONSES,
                 )
+            elif result == "limit_reached":
+                logger.warning(f"🛑 hh.ru сообщил об исчерпании лимита откликов — останавливаю прогон, откладываю на {config.RATE_LIMIT_BACKOFF_MINUTES} мин")
+                database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES)
+                break
+            elif result == "manual":
+                database.save_manual_review(vacancy, reason)
+                logger.warning(f"✋ На ручную обработку (\"{reason}\"): \"{vacancy['vacancy_title']}\" — {vacancy['company_name']}")
+                stats["manual"] += 1
             else:
                 stats["errors"] += 1
 
@@ -55,21 +81,39 @@ async def run_responses(page) -> dict:
 
 
 async def _search_vacancies(page) -> list[dict]:
-    """Открыть страницу поиска и собрать список вакансий."""
-    params = [
-        ("text", config.VACANCY_SEARCH_TEXT),
-        *[("search_field", f) for f in config.VACANCY_SEARCH_FIELD],
-        ("items_on_page", str(config.VACANCY_ITEMS_ON_PAGE)),
-        ("search_period", str(config.VACANCY_SEARCH_PERIOD)),
-    ]
+    """Открыть страницу поиска и собрать список вакансий по всем страницам выдачи."""
+    all_vacancies: list[dict] = []
+    seen_ids: set[str] = set()
 
-    url = "https://hh.ru/search/vacancy?" + urllib.parse.urlencode(params)
+    for page_num in range(config.VACANCY_MAX_PAGES):
+        params = [
+            ("text", config.VACANCY_SEARCH_TEXT),
+            *[("search_field", f) for f in config.VACANCY_SEARCH_FIELD],
+            ("items_on_page", str(config.VACANCY_ITEMS_ON_PAGE)),
+            ("search_period", str(config.VACANCY_SEARCH_PERIOD)),
+            ("page", str(page_num)),
+        ]
+        url = "https://hh.ru/search/vacancy?" + urllib.parse.urlencode(params)
 
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2000)
-    await human_delay.scroll_naturally(page)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2000)
+        await human_delay.scroll_naturally(page)
 
-    return await _parse_vacancy_list(page)
+        page_vacancies = await _parse_vacancy_list(page)
+        new_on_page = 0
+        for v in page_vacancies:
+            if v["vacancy_id"] not in seen_ids:
+                seen_ids.add(v["vacancy_id"])
+                all_vacancies.append(v)
+                new_on_page += 1
+
+        if len(page_vacancies) < config.VACANCY_ITEMS_ON_PAGE or new_on_page == 0:
+            # Последняя страница выдачи или дальше идут дубликаты
+            break
+
+        await human_delay.short_pause(2, 5)
+
+    return all_vacancies
 
 
 async def _parse_vacancy_list(page) -> list[dict]:
@@ -101,7 +145,6 @@ async def _extract_vacancy_data(item) -> dict | None:
             const titleTextEl = el.querySelector("[data-qa='serp-item__title-text']");
             const companyEl = el.querySelector("[data-qa='vacancy-serp__vacancy-employer-text']")
                            || el.querySelector("[data-qa='vacancy-serp__vacancy-employer']");
-            const salaryEl = el.querySelector("[data-qa='vacancy-serp__compensation']");
             const innerIdEl = el.querySelector('[id]');
 
             const url = titleEl
@@ -109,11 +152,23 @@ async def _extract_vacancy_data(item) -> dict | None:
                 : '';
             const innerId = innerIdEl && /^\\d+$/.test(innerIdEl.id) ? innerIdEl.id : null;
 
+            // Зарплата в новой вёрстке hh.ru (Magritte) не имеет data-qa —
+            // ищем текстовый узел с валютой и берём текст его родителя
+            let salary = '';
+            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+            let node;
+            while (node = walker.nextNode()) {
+                if (/[₸₽$€]/.test(node.textContent)) {
+                    salary = node.parentElement.innerText.replace(/[\\s\\u00a0\\u202f]+/g, ' ').trim();
+                    break;
+                }
+            }
+
             return {
                 url: url || (innerId ? 'https://hh.ru/vacancy/' + innerId : null),
                 title: (titleTextEl || titleEl)?.innerText?.trim() || null,
                 company: companyEl?.innerText?.trim() || '',
-                salary: salaryEl?.innerText?.trim() || '',
+                salary: salary,
                 innerId: innerId
             };
         }""")
@@ -174,8 +229,15 @@ def _filter_vacancies(vacancies: list[dict]) -> list[dict]:
     return result
 
 
-async def _respond_to_vacancy(page, vacancy: dict) -> bool:
-    """Открыть вакансию и откликнуться. Возвращает True при успехе."""
+async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
+    """
+    Открыть вакансию и откликнуться.
+    Возвращает (status, reason), где status одно из:
+      "sent"          — отклик подтверждён
+      "manual"        — бот не смог довести отклик до конца, нужна ручная обработка (reason заполнен)
+      "error"         — техническая ошибка (таймаут, исключение)
+      "limit_reached" — hh.ru сообщил об исчерпании дневного лимита откликов
+    """
     context = page.context
     new_tab = await context.new_page()
     try:
@@ -193,11 +255,22 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
         if not respond_btn:
             respond_btn = await new_tab.query_selector("a[data-qa*='response']")
         if not respond_btn:
-            logger.debug(f"Кнопка отклика не найдена: {clean_url}")
-            return False
+            reason = "Нет кнопки 'Откликнуться' на странице вакансии"
+            logger.warning(f"{reason}: {clean_url}")
+            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_button")
+            return "manual", reason
 
         await respond_btn.click(force=True, timeout=60000)
         await new_tab.wait_for_timeout(2000)
+
+        # hh.ru показывает тост "Вы исчерпали лимит откликов" при достижении
+        # реального лимита (200 за скользящие 24 часа); тост иногда всплывает
+        # с задержкой, поэтому эта же проверка повторяется ниже по функции
+        if await _check_rate_limited(new_tab):
+            reason = "hh.ru: лимит откликов исчерпан (не более 200 за 24 часа)"
+            logger.warning(f"{reason}: {clean_url}")
+            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
+            return "limit_reached", reason
 
         # Модалка "Вы откликаетесь на вакансию в другой стране"
         cross_country_btn = await new_tab.query_selector("[data-qa='relocation-warning-confirm']")
@@ -207,6 +280,14 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
             logger.debug("Модалка 'другая страна' — подтверждаем")
             await cross_country_btn.click(force=True)
             await new_tab.wait_for_timeout(1500)
+
+        # На части вакансий hh.ru отправляет отклик мгновенно по первому клику
+        # (без формы сопроводительного письма) и сразу открывает чат с работодателем.
+        # Если это произошло — выходим сейчас же, не трогая текстовые поля на странице
+        # (иначе шаблон письма уйдёт как сообщение в уже открывшийся чат).
+        if await _check_response_success(new_tab):
+            logger.debug("Отклик отправлен мгновенно (без формы письма)")
+            return "sent", None
 
         # Если появилось поле сопроводительного письма
         cover_input = await new_tab.query_selector("[data-qa='vacancy-response-popup-form-letter-input']")
@@ -227,20 +308,60 @@ async def _respond_to_vacancy(page, vacancy: dict) -> bool:
             submit_btn = await new_tab.query_selector("button[data-qa*='submit']")
         if not submit_btn:
             submit_btn = await new_tab.query_selector("button:has-text('Отправить')")
-        if submit_btn:
-            await submit_btn.click(force=True, timeout=60000)
-            await new_tab.wait_for_timeout(2000)
+
+        if not submit_btn:
+            # Тост о лимите иногда всплывает с задержкой — проверяем ещё раз
+            # перед тем как решить, что это просто незнакомая форма
+            if await _check_rate_limited(new_tab):
+                reason = "hh.ru: лимит откликов исчерпан (не более 200 за 24 часа)"
+                logger.warning(f"{reason}: {clean_url}")
+                await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
+                return "limit_reached", reason
+
+            # Кнопка отклика была, но дальше — незнакомая форма/модалка
+            # (например, тест или вопросы работодателя), которую бот не умеет заполнять
+            reason = "После клика 'Откликнуться' появилась незнакомая форма без кнопки отправки"
+            logger.warning(f"{reason}: {clean_url}")
+            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_submit")
+            return "manual", reason
+
+        await submit_btn.click(force=True, timeout=60000)
+        await new_tab.wait_for_timeout(2000)
 
         # Проверить подтверждение
         success = await _check_response_success(new_tab)
-        return success
+        if success:
+            return "sent", None
+
+        if await _check_rate_limited(new_tab):
+            reason = "hh.ru: лимит откликов исчерпан (не более 200 за 24 часа)"
+            logger.warning(f"{reason}: {clean_url}")
+            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
+            return "limit_reached", reason
+
+        reason = "Отклик отправлен, но подтверждение не найдено (возможно, доп. вопросы работодателя)"
+        logger.warning(f"{reason}: {clean_url}")
+        await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_confirmation")
+        return "manual", reason
 
     except Exception as e:
         logger.error(f"Ошибка отклика на вакансию {vacancy['vacancy_url']}: {e}")
         await save_error_screenshot(new_tab, f"respond_error_{vacancy['vacancy_id']}")
-        return False
+        return "error", str(e)
     finally:
         await new_tab.close()
+
+
+async def _save_review_screenshot(page, vacancy_id: str, tag: str) -> None:
+    await save_error_screenshot(page, f"manual_review_{tag}_{vacancy_id}")
+
+
+async def _check_rate_limited(page) -> bool:
+    """Проверить тост hh.ru об исчерпании лимита откликов (200 за 24 часа)."""
+    try:
+        return await page.query_selector("text=исчерпали лимит откликов") is not None
+    except Exception:
+        return False
 
 
 async def _check_response_success(page) -> bool:
@@ -249,8 +370,10 @@ async def _check_response_success(page) -> bool:
         selectors = [
             "#dialog-description:has-text('Отклик отправлен')",
             "[data-qa='vacancy-response-success']",
+            "[data-qa='vacancy-response-success-standard-notification']",
             "text=Отклик отправлен",
             "text=Вы откликнулись",
+            "text=Резюме доставлено",
         ]
         for sel in selectors:
             el = await page.query_selector(sel)

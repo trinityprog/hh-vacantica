@@ -4,6 +4,7 @@ import sys
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 
 import browser
@@ -40,7 +41,10 @@ async def task_respond_to_vacancies():
             logger.error("Страница браузера не инициализирована")
             return
         stats = await vacancies.run_responses(_page)
-        logger.info(f"Итог откликов: отправлено={stats['sent']}, пропущено={stats['skipped']}, ошибок={stats['errors']}")
+        logger.info(
+            f"Итог откликов: отправлено={stats['sent']}, пропущено={stats['skipped']}, "
+            f"на ручную обработку={stats['manual']}, ошибок={stats['errors']}"
+        )
     except Exception as e:
         logger.error(f"Ошибка в задаче откликов: {e}")
 
@@ -59,17 +63,20 @@ async def setup_scheduler():
             name=f"Поднятие резюме {time_str}",
         )
 
-    for time_str in config.VACANCY_SCHEDULE_TIMES:
-        hour, minute = time_str.split(":")
-        scheduler.add_job(
-            task_respond_to_vacancies,
-            CronTrigger(hour=int(hour), minute=int(minute), timezone=tz),
-            id=f"vacancies_{time_str}",
-            name=f"Отклики {time_str}",
-        )
+    scheduler.add_job(
+        task_respond_to_vacancies,
+        IntervalTrigger(minutes=config.VACANCY_INTERVAL_MINUTES, timezone=tz),
+        id="vacancies_interval",
+        name=f"Отклики каждые {config.VACANCY_INTERVAL_MINUTES} мин",
+        max_instances=1,
+        coalesce=True,
+    )
 
     scheduler.start()
-    logger.info(f"Планировщик запущен. Резюме: {config.RESUME_SCHEDULE_TIMES}, Отклики: {config.VACANCY_SCHEDULE_TIMES}")
+    logger.info(
+        f"Планировщик запущен. Резюме: {config.RESUME_SCHEDULE_TIMES}, "
+        f"Отклики: каждые {config.VACANCY_INTERVAL_MINUTES} мин, круглосуточно"
+    )
 
 
 async def shutdown():
