@@ -11,6 +11,7 @@ import browser
 import config
 import dashboard
 import database
+import negotiations
 import resume
 import vacancies
 from logger import logger
@@ -26,6 +27,9 @@ async def task_publish_resume():
         if _page is None:
             logger.error("Страница браузера не инициализирована")
             return
+        if not await browser.is_logged_in(_page):
+            logger.error("Сессия hh.ru недействительна (разлогин) — пропускаю задачу. Запустите: python main.py --login")
+            return
         result = await resume.publish_resume(_page)
         logger.info(f"Поднятие резюме: поднято={result['raised']}, пропущено={result['skipped']}, ошибок={result['errors']}")
         stats = database.get_stats()
@@ -40,6 +44,9 @@ async def task_respond_to_vacancies():
         if _page is None:
             logger.error("Страница браузера не инициализирована")
             return
+        if not await browser.is_logged_in(_page):
+            logger.error("Сессия hh.ru недействительна (разлогин) — пропускаю задачу. Запустите: python main.py --login")
+            return
         stats = await vacancies.run_responses(_page)
         logger.info(
             f"Итог откликов: отправлено={stats['sent']}, пропущено={stats['skipped']}, "
@@ -47,6 +54,21 @@ async def task_respond_to_vacancies():
         )
     except Exception as e:
         logger.error(f"Ошибка в задаче откликов: {e}")
+
+
+async def task_sync_negotiations():
+    global _page
+    try:
+        if _page is None:
+            logger.error("Страница браузера не инициализирована")
+            return
+        if not await browser.is_logged_in(_page):
+            logger.error("Сессия hh.ru недействительна (разлогин) — пропускаю задачу. Запустите: python main.py --login")
+            return
+        await negotiations.sync_statuses(_page)
+        await negotiations.sync_unread_chats(_page)
+    except Exception as e:
+        logger.error(f"Ошибка в задаче синхронизации статусов: {e}")
 
 
 async def setup_scheduler():
@@ -72,10 +94,20 @@ async def setup_scheduler():
         coalesce=True,
     )
 
+    scheduler.add_job(
+        task_sync_negotiations,
+        IntervalTrigger(minutes=config.NEGOTIATIONS_SYNC_INTERVAL_MINUTES, timezone=tz),
+        id="negotiations_sync",
+        name=f"Синхронизация статусов откликов каждые {config.NEGOTIATIONS_SYNC_INTERVAL_MINUTES} мин",
+        max_instances=1,
+        coalesce=True,
+    )
+
     scheduler.start()
     logger.info(
         f"Планировщик запущен. Резюме: {config.RESUME_SCHEDULE_TIMES}, "
-        f"Отклики: каждые {config.VACANCY_INTERVAL_MINUTES} мин, круглосуточно"
+        f"Отклики: каждые {config.VACANCY_INTERVAL_MINUTES} мин, круглосуточно, "
+        f"Синхронизация статусов: каждые {config.NEGOTIATIONS_SYNC_INTERVAL_MINUTES} мин"
     )
 
 
