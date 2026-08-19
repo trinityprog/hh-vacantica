@@ -1,6 +1,7 @@
 import datetime
 import os
 
+import browser
 import config
 import database
 import human_delay
@@ -13,10 +14,22 @@ async def publish_resume(page) -> dict:
     Возвращает {"raised": int, "skipped": int, "errors": int}
     """
     stats = {"raised": 0, "skipped": 0, "errors": 0}
+
+    is_limited, blocked_until = database.get_rate_limit_status()
+    if is_limited:
+        logger.info(f"hh.ru блокировка активна до {blocked_until} UTC — пропускаю поднятие резюме")
+        return stats
+
     try:
         logger.info("Запуск задачи: поднятие резюме")
         await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
+
+        if await browser.is_ddos_challenge(page):
+            logger.warning("DDoS-Guard проверка браузера на странице резюме — откладываю попытки")
+            database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES)
+            await save_error_screenshot(page, "resume_ddos_guard")
+            return stats
 
         resume_blocks = await _find_all_resume_blocks(page)
         if not resume_blocks:
