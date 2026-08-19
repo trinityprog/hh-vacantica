@@ -2,6 +2,7 @@ import asyncio
 import urllib.parse
 from datetime import date
 
+import browser
 import config
 import database
 import human_delay
@@ -97,6 +98,12 @@ async def _search_vacancies(page) -> list[dict]:
 
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(2000)
+
+        if await browser.is_ddos_challenge(page):
+            logger.warning("DDoS-Guard проверка браузера на странице поиска — откладываю попытки")
+            database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES)
+            break
+
         await human_delay.scroll_naturally(page)
 
         page_vacancies = await _parse_vacancy_list(page)
@@ -246,6 +253,23 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
 
         await new_tab.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
         await new_tab.wait_for_timeout(2000)
+
+        if await browser.is_ddos_challenge(new_tab):
+            # Не считаем это сразу поводом для ручной обработки или блокировки всего
+            # прогона — часто это разовая помеха. Ждём и пробуем эту же вакансию ещё раз.
+            logger.warning(f"DDoS-Guard проверка браузера, повторю попытку: {clean_url}")
+            await human_delay.pause(config.MIN_DELAY_BETWEEN_RESPONSES, config.MAX_DELAY_BETWEEN_RESPONSES)
+            await new_tab.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
+            await new_tab.wait_for_timeout(2000)
+
+            if await browser.is_ddos_challenge(new_tab):
+                reason = "DDoS-Guard проверка браузера — не прошла и со второй попытки"
+                logger.warning(f"{reason}: {clean_url}")
+                await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "ddos_guard")
+                return "manual", reason
+
+            logger.debug("DDoS-Guard прошла со второй попытки, продолжаю")
+
         await human_delay.scroll_naturally(new_tab)
 
         # Нажать кнопку "Откликнуться"
@@ -272,10 +296,16 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
             await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
             return "limit_reached", reason
 
-        # Модалка "Вы откликаетесь на вакансию в другой стране"
-        cross_country_btn = await new_tab.query_selector("[data-qa='relocation-warning-confirm']")
-        if not cross_country_btn:
-            cross_country_btn = await new_tab.query_selector("button:has-text('Все равно откликнуться')")
+        # Модалка "Вы откликаетесь на вакансию в другой стране" — рендерится асинхронно
+        # и может появиться позже фиксированной паузы выше, поэтому здесь именно
+        # ожидание появления (wait_for_selector), а не мгновенная проверка
+        cross_country_btn = None
+        for sel in ["[data-qa='relocation-warning-confirm']", "button:has-text('Все равно откликнуться')"]:
+            try:
+                cross_country_btn = await new_tab.wait_for_selector(sel, timeout=3000, state="visible")
+                break
+            except Exception:
+                continue
         if cross_country_btn:
             logger.debug("Модалка 'другая страна' — подтверждаем")
             await cross_country_btn.click(force=True)
@@ -297,6 +327,14 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
             cover_input = await new_tab.query_selector("textarea[placeholder*='письм']")
 
         if cover_input:
+            # Тост о лимите иногда всплывает уже к этому моменту — если печатать
+            # в уже неактуальное поле, это может подвесить посимвольный ввод
+            if await _check_rate_limited(new_tab):
+                reason = "hh.ru: лимит откликов исчерпан (не более 200 за 24 часа)"
+                logger.warning(f"{reason}: {clean_url}")
+                await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
+                return "limit_reached", reason
+
             await cover_input.click(force=True)
             for char in config.COVER_LETTER_TEMPLATE:
                 await cover_input.type(char, delay=random_char_delay())
