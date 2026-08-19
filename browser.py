@@ -62,11 +62,38 @@ async def new_page() -> Page:
     return page
 
 
+async def is_ddos_challenge(page: Page) -> bool:
+    """
+    Определяет страницу проверки DDoS-Guard ('Checking your browser before accessing hh.ru').
+    Бот НЕ пытается её проходить (это капча/защита от ботов) — только распознаёт,
+    чтобы не путать блокировку с реальным отсутствием элементов на странице.
+
+    Логотип "DDOS-GUARD" на странице — скорее всего SVG/картинка, а не текстовый
+    узел DOM, поэтому текстовый селектор по нему ненадёжен. Проверяем title
+    и полный innerText body — заголовок "Checking your browser..." это обычный H1.
+    """
+    try:
+        title = (await page.title() or "").lower()
+        if "checking your browser" in title:
+            return True
+        body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        body_text = (body_text or "").lower()
+        return "checking your browser before accessing" in body_text or "ddos-guard" in body_text
+    except Exception:
+        return False
+
+
 async def is_logged_in(page: Page) -> bool:
+    """
+    Проверяет реальное состояние авторизации по содержимому страницы, а не по URL:
+    при разлогине hh.ru рендерит форму входа поверх /applicant/resumes,
+    не меняя сам путь в адресной строке — проверка по URL всегда давала ложный True.
+    """
     try:
         await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
-        return "login" not in page.url and "account" not in page.url
+        login_form = await page.query_selector("[data-qa='account-login-form']")
+        return login_form is None
     except Exception as e:
         logger.error(f"Ошибка проверки авторизации: {e}")
         return False
