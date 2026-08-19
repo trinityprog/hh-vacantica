@@ -32,12 +32,13 @@ HTML = """<!DOCTYPE html>
   .container { padding: 24px; max-width: 1200px; margin: 0 auto; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
   .card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; padding: 20px; }
+  .card[style*="cursor:pointer"]:hover { border-color: #3b82f6; }
   .card-label { color: #64748b; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
   .card-value { font-size: 32px; font-weight: 700; color: #fff; }
   .card-value.green { color: #22c55e; }
   .card-value.blue  { color: #60a5fa; }
   .card-value.amber { color: #fbbf24; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; align-items: start; }
   @media(max-width:768px){ .grid2 { grid-template-columns: 1fr; } }
   .panel { background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; overflow: hidden; }
   .panel-header { padding: 14px 18px; border-bottom: 1px solid #2d3148; font-size: 13px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; }
@@ -68,6 +69,8 @@ HTML = """<!DOCTYPE html>
   .pager button { background: #1e2235; border: 1px solid #2d3148; color: #cbd5e1; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
   .pager button:disabled { opacity: .4; cursor: default; }
   .pager button:not(:disabled):hover { background: #2d3148; }
+  td button { background: #1e2235; border: 1px solid #2d3148; color: #cbd5e1; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  td button:hover { background: #2d3148; }
 </style>
 </head>
 <body>
@@ -87,11 +90,17 @@ HTML = """<!DOCTYPE html>
       <div id="responses-table"></div>
       <div class="pager" id="responses-pager"></div>
     </div>
-    <div class="panel">
-      <div class="panel-header">Поднятия резюме</div>
-      <div class="panel-toolbar"><input class="panel-search" id="publishes-search" placeholder="Поиск по сообщению…"></div>
-      <div id="publishes-table"></div>
-      <div class="pager" id="publishes-pager"></div>
+    <div>
+      <div class="panel" id="publishes-panel" style="display:none">
+        <div class="panel-header">Поднятия резюме</div>
+        <div class="panel-toolbar"><input class="panel-search" id="publishes-search" placeholder="Поиск по сообщению…"></div>
+        <div id="publishes-table"></div>
+        <div class="pager" id="publishes-pager"></div>
+      </div>
+      <div class="panel" id="unread-chats-panel">
+        <div class="panel-header">Ждут вашего ответа в чате</div>
+        <div id="unread-chats-table"></div>
+      </div>
     </div>
   </div>
   <div class="panel" style="margin-bottom:16px">
@@ -108,6 +117,13 @@ HTML = """<!DOCTYPE html>
 
 <script>
 let countdown = 30;
+
+const SIDE_PANELS = ['publishes-panel', 'unread-chats-panel'];
+function showSidePanel(id) {
+  SIDE_PANELS.forEach(pid => {
+    document.getElementById(pid).style.display = pid === id ? '' : 'none';
+  });
+}
 
 function classForLevel(line) {
   if (line.includes(' ERROR ')) return 'log-ERROR';
@@ -144,14 +160,27 @@ const panels = {
 const tableIds = { responses: 'responses-table', publishes: 'publishes-table', manual: 'manual-review-table' };
 const pagerIds = { responses: 'responses-pager', publishes: 'publishes-pager', manual: 'manual-pager' };
 
+function statusBadge(status) {
+  const map = {
+    'Собеседование': '#22c55e',
+    'Отказ': '#f87171',
+    'Просмотрен': '#60a5fa',
+    'Не просмотрен': '#64748b',
+  };
+  const color = map[status] || '#475569';
+  const label = status && status !== 'sent' ? status : 'Отправлен';
+  return `<span style="color:${color};font-size:12px">${label}</span>`;
+}
+
 function renderResponses(rows) {
   if (rows.length === 0) return '<div class="empty">Ничего не найдено</div>';
   const trs = rows.map(r => `
-    <tr>
-      <td><a href="${r.vacancy_url}" target="_blank">${r.vacancy_title}</a><br><span class="time">${r.company_name}</span></td>
+    <tr style="${r.unread ? 'background:#f472b608' : ''}">
+      <td>${r.unread ? '<span title="Ждёт вашего ответа в чате" style="color:#f472b6">●</span> ' : ''}<a href="${r.vacancy_url}" target="_blank">${r.vacancy_title}</a><br><span class="time">${r.company_name}</span></td>
       <td><span class="salary">${r.salary_text || '—'}</span><br><span class="time">${timeAgo(r.responded_at)}</span></td>
+      <td>${statusBadge(r.status)}</td>
     </tr>`).join('');
-  return `<table><thead><tr><th>Вакансия</th><th>Зарплата</th></tr></thead><tbody>${trs}</tbody></table>`;
+  return `<table><thead><tr><th>Вакансия</th><th>Зарплата</th><th>Статус</th></tr></thead><tbody>${trs}</tbody></table>`;
 }
 
 function renderPublishes(rows) {
@@ -172,8 +201,14 @@ function renderManual(rows) {
       <td><a href="${m.vacancy_url}" target="_blank">${m.vacancy_title}</a><br><span class="time">${m.company_name}</span></td>
       <td style="font-size:12px">${m.reason}</td>
       <td><span class="time">${timeAgo(m.created_at)}</span></td>
+      <td><button onclick="markHandled('${m.vacancy_id}')">Обработал</button></td>
     </tr>`).join('');
-  return `<table><thead><tr><th>Вакансия</th><th>Причина</th><th>Время</th></tr></thead><tbody>${trs}</tbody></table>`;
+  return `<table><thead><tr><th>Вакансия</th><th>Причина</th><th>Время</th><th></th></tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+async function markHandled(vacancyId) {
+  await fetch(`/api/manual_review/${encodeURIComponent(vacancyId)}/handle`, { method: 'POST' });
+  await loadPanel('manual');
 }
 
 const renderers = { responses: renderResponses, publishes: renderPublishes, manual: renderManual };
@@ -220,10 +255,25 @@ async function load() {
   document.getElementById('cards').innerHTML = `
     <div class="card"><div class="card-label">Всего откликов</div><div class="card-value blue">${data.stats.total_responses}</div></div>
     <div class="card"><div class="card-label">Сегодня откликов</div><div class="card-value green">${data.stats.today_responses}</div></div>
-    <div class="card"><div class="card-label">Поднятий резюме</div><div class="card-value amber">${data.stats.total_publishes}</div></div>
+    <div class="card" style="cursor:pointer" onclick="showSidePanel('publishes-panel')"><div class="card-label">Поднятий резюме</div><div class="card-value amber">${data.stats.total_publishes}</div></div>
     <div class="card"><div class="card-label">На ручную обработку</div><div class="card-value" style="color:#f472b6">${data.stats.manual_review_count}</div></div>
+    <div class="card" style="cursor:pointer" onclick="window.open('https://hh.ru/applicant/negotiations?filter=all&state=INTERVIEW', '_blank')"><div class="card-label">Собеседований</div><div class="card-value green">${data.stats.interview_count}</div></div>
+    <div class="card" style="cursor:pointer" onclick="showSidePanel('unread-chats-panel')"><div class="card-label">Ждут ответа в чате</div><div class="card-value" style="color:#f472b6">${data.stats.unread_count}</div></div>
     <div class="card"><div class="card-label">Последний отклик</div><div class="card-value" style="font-size:16px;padding-top:6px">${data.last_response ? formatLocal(data.last_response) : '—'}</div></div>
   `;
+
+  // Unread chats
+  if (data.unread_chats.length === 0) {
+    document.getElementById('unread-chats-table').innerHTML = '<div class="empty">Нет чатов, ждущих ответа</div>';
+  } else {
+    const trs = data.unread_chats.map(c => `
+      <tr>
+        <td>${c.vacancy_title}<br><span class="time">${c.company_name}</span></td>
+        <td style="font-size:12px;max-width:400px;white-space:pre-wrap">${(c.last_message || '').slice(0, 200)}</td>
+        <td><a href="${c.chat_url}" target="_blank">Открыть чат →</a></td>
+      </tr>`).join('');
+    document.getElementById('unread-chats-table').innerHTML = `<table><thead><tr><th>Вакансия</th><th>Сообщение</th><th></th></tr></thead><tbody>${trs}</tbody></table>`;
+  }
 
   // Log
   const logEl = document.getElementById('log');
@@ -276,6 +326,7 @@ def api_data():
         "stats": stats,
         "log": log_lines,
         "last_response": last_response,
+        "unread_chats": database.get_unread_chats(),
     })
 
 
@@ -304,6 +355,12 @@ def api_manual_review():
     page = request.args.get("page", 1, type=int)
     rows, total = database.get_manual_review(q, page, PAGE_SIZE)
     return jsonify({"rows": rows, "total": total, "page": page, "page_size": PAGE_SIZE})
+
+
+@app.route("/api/manual_review/<vacancy_id>/handle", methods=["POST"])
+def api_manual_review_handle(vacancy_id):
+    database.mark_manual_review_handled(vacancy_id)
+    return jsonify({"status": "ok"})
 
 
 @app.route("/webhook", methods=["POST"])
