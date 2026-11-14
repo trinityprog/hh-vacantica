@@ -49,7 +49,8 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS rate_limit_state (
                 id           INTEGER PRIMARY KEY CHECK (id = 1),
-                blocked_until DATETIME
+                blocked_until DATETIME,
+                reason        TEXT
             );
         """)
         # миграция для БД, созданных до появления колонки handled
@@ -64,6 +65,10 @@ def init_db():
             conn.execute("ALTER TABLE responses ADD COLUMN chat_url TEXT")
         if "last_message" not in cols:
             conn.execute("ALTER TABLE responses ADD COLUMN last_message TEXT")
+        # миграция для БД, созданных до появления колонки reason
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(rate_limit_state)").fetchall()]
+        if "reason" not in cols:
+            conn.execute("ALTER TABLE rate_limit_state ADD COLUMN reason TEXT")
 
 
 def is_already_responded(vacancy_id: str) -> bool:
@@ -114,6 +119,16 @@ def is_in_manual_review(vacancy_id: str) -> bool:
             "SELECT 1 FROM manual_review WHERE vacancy_id = ?", (vacancy_id,)
         ).fetchone()
         return row is not None
+
+
+def get_unhandled_manual_review() -> list[dict]:
+    """Вакансии, ждущие ручной обработки (старые — первыми)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT vacancy_id, vacancy_title, company_name, vacancy_url, salary_text "
+            "FROM manual_review WHERE handled = 0 ORDER BY created_at"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def mark_manual_review_handled(vacancy_id: str) -> None:
@@ -205,25 +220,25 @@ def get_manual_review(search: str = "", page: int = 1, page_size: int = 15) -> t
     return _paginate(rows, search, ["vacancy_title", "company_name", "reason"], page, page_size)
 
 
-def set_rate_limited(minutes: int) -> None:
-    """Отметить, что hh.ru сообщил о превышении лимита откликов — отложить попытки на N минут."""
+def set_rate_limited(minutes: int, reason: str = "hh.ru: лимит откликов исчерпан") -> None:
+    """Отложить попытки на N минут. reason — что именно сработало (лимит откликов / DDoS-Guard)."""
     blocked_until = datetime.utcnow() + timedelta(minutes=minutes)
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO rate_limit_state (id, blocked_until) VALUES (1, ?) "
-            "ON CONFLICT(id) DO UPDATE SET blocked_until = excluded.blocked_until",
-            (blocked_until.isoformat(sep=" "),),
+            "INSERT INTO rate_limit_state (id, blocked_until, reason) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET blocked_until = excluded.blocked_until, reason = excluded.reason",
+            (blocked_until.isoformat(sep=" "), reason),
         )
 
 
-def get_rate_limit_status() -> tuple[bool, "datetime | None"]:
-    """Возвращает (заблокировано_ли_сейчас, до_какого_момента_UTC)."""
+def get_rate_limit_status() -> tuple[bool, "datetime | None", str | None]:
+    """Возвращает (заблокировано_ли_сейчас, до_какого_момента_UTC, причина)."""
     with _connect() as conn:
-        row = conn.execute("SELECT blocked_until FROM rate_limit_state WHERE id = 1").fetchone()
+        row = conn.execute("SELECT blocked_until, reason FROM rate_limit_state WHERE id = 1").fetchone()
     if not row or not row["blocked_until"]:
-        return False, None
+        return False, None, None
     blocked_until = datetime.fromisoformat(row["blocked_until"])
-    return datetime.utcnow() < blocked_until, blocked_until
+    return datetime.utcnow() < blocked_until, blocked_until, row["reason"]
 
 
 def count_today_responses() -> int:

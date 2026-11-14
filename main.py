@@ -1,6 +1,8 @@
 import asyncio
+import os
 import signal
 import sys
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -38,16 +40,24 @@ async def task_publish_resume():
         logger.error(f"Ошибка в задаче поднятия резюме: {e}")
 
 
-async def task_respond_to_vacancies():
+async def task_respond_to_vacancies(profile_name: str | None = None):
     global _page
     try:
         if _page is None:
             logger.error("Страница браузера не инициализирована")
             return
+        if config.RESPOND_ACTIVE_HOURS and profile_name is None:
+            start, end = config.RESPOND_ACTIVE_HOURS
+            hour = datetime.now(pytz.timezone(config.TIMEZONE)).hour
+            if not (start <= hour < end):
+                logger.info(f"Вне активных часов {start}:00–{end}:00 — пропускаю прогон")
+                return
         if not await browser.is_logged_in(_page):
             logger.error("Сессия hh.ru недействительна (разлогин) — пропускаю задачу. Запустите: python main.py --login")
             return
-        stats = await vacancies.run_responses(_page)
+        # hh.ru может обновлять куки сессии — сохраняем свежие, чтобы после перезапуска не потерять вход
+        await browser.save_session(_page)
+        stats = await vacancies.run_responses(_page, profile_name)
         logger.info(
             f"Итог откликов: отправлено={stats['sent']}, пропущено={stats['skipped']}, "
             f"на ручную обработку={stats['manual']}, ошибок={stats['errors']}"
@@ -87,11 +97,16 @@ async def setup_scheduler():
 
     scheduler.add_job(
         task_respond_to_vacancies,
-        IntervalTrigger(minutes=config.VACANCY_INTERVAL_MINUTES, timezone=tz),
+        IntervalTrigger(
+            minutes=config.VACANCY_INTERVAL_MINUTES,
+            jitter=config.VACANCY_INTERVAL_JITTER_SECONDS,
+            timezone=tz,
+        ),
         id="vacancies_interval",
         name=f"Отклики каждые {config.VACANCY_INTERVAL_MINUTES} мин",
         max_instances=1,
         coalesce=True,
+        next_run_time=datetime.now(tz),   # первый прогон сразу при старте, не через интервал
     )
 
     scheduler.add_job(
@@ -106,7 +121,7 @@ async def setup_scheduler():
     scheduler.start()
     logger.info(
         f"Планировщик запущен. Резюме: {config.RESUME_SCHEDULE_TIMES}, "
-        f"Отклики: каждые {config.VACANCY_INTERVAL_MINUTES} мин, круглосуточно, "
+        f"Отклики: каждые {config.VACANCY_INTERVAL_MINUTES} мин, часы {config.RESPOND_ACTIVE_HOURS or 'круглосуточно'}, "
         f"Синхронизация статусов: каждые {config.NEGOTIATIONS_SYNC_INTERVAL_MINUTES} мин"
     )
 
@@ -123,7 +138,7 @@ async def run_login():
     """Режим первого входа — ручная авторизация."""
     logger.info("Режим авторизации: откроется браузер, войдите вручную.")
     await browser.start_playwright()
-    _, ctx = await browser.load_session()
+    _, ctx = await browser.load_session(headless=False)  # вход вручную — окно должно быть видно
     page = await ctx.new_page()
     await browser.login_manually(page)
     await browser.save_session(page)
@@ -147,8 +162,8 @@ async def run_now_publish():
     await browser.stop_playwright()
 
 
-async def run_now_respond():
-    """Немедленный запуск откликов (режим тестирования)."""
+async def run_now_respond(profile_name: str | None = None):
+    """Немедленный запуск откликов (режим тестирования). profile_name — профиль поиска из config."""
     global _page
     await browser.start_playwright()
     _, ctx = await browser.load_session()
@@ -159,7 +174,26 @@ async def run_now_respond():
         await browser.stop_playwright()
         return
 
-    await task_respond_to_vacancies()
+    await task_respond_to_vacancies(profile_name)
+    await browser.stop_playwright()
+
+
+async def run_retry_manual(profile_name: str | None = None):
+    """Повторно прогнать вакансии из списка «На ручную обработку»."""
+    await browser.start_playwright()
+    _, ctx = await browser.load_session()
+    page = await ctx.new_page()
+
+    if not await browser.is_logged_in(page):
+        logger.error("Сессия недействительна. Запустите: python main.py --login")
+        await browser.stop_playwright()
+        return
+
+    stats = await vacancies.retry_manual_review(page, profile_name or "non_dev")
+    logger.info(
+        f"Итог повторного прогона: отправлено={stats['sent']}, пропущено={stats['skipped']}, "
+        f"осталось в ручных={stats['manual']}, ошибок={stats['errors']}"
+    )
     await browser.stop_playwright()
 
 
@@ -181,8 +215,9 @@ async def run_scheduler():
     stats = database.get_stats()
     logger.info(f"База данных: {stats}")
 
-    dashboard.start_dashboard(port=8888)
-    logger.info("Дашборд запущен: http://0.0.0.0:8888")
+    port = int(os.getenv("DASHBOARD_PORT", "8888"))
+    dashboard.start_dashboard(port=port)
+    logger.info(f"Дашборд запущен: http://0.0.0.0:{port}")
 
     await setup_scheduler()
 
@@ -216,9 +251,14 @@ def main():
     elif "--now-publish" in args:
         database.init_db()
         asyncio.run(run_now_publish())
+    elif "--retry-manual" in args:
+        database.init_db()
+        profile_name = args[args.index("--profile") + 1] if "--profile" in args else None
+        asyncio.run(run_retry_manual(profile_name))
     elif "--now-respond" in args:
         database.init_db()
-        asyncio.run(run_now_respond())
+        profile_name = args[args.index("--profile") + 1] if "--profile" in args else None
+        asyncio.run(run_now_respond(profile_name))
     else:
         try:
             asyncio.run(run_scheduler())

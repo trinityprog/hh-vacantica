@@ -1,4 +1,6 @@
 import asyncio
+import itertools
+import re
 import urllib.parse
 from datetime import date
 
@@ -8,17 +10,53 @@ import database
 import human_delay
 from logger import logger, save_error_screenshot
 
+# Профили поиска чередуются от прогона к прогону (см. config.SEARCH_PROFILES)
+_profile_cycle = itertools.cycle(
+    [p for p in config.SEARCH_PROFILES if p["name"] in config.ACTIVE_PROFILES]
+)
+_resume_id_cache: dict[str, str] = {}
 
-async def run_responses(page) -> dict:
+
+async def _resolve_resume_id(page, title: str) -> str | None:
+    """Найти id резюме по названию на странице /applicant/resumes."""
+    if title in _resume_id_cache:
+        return _resume_id_cache[title]
+    await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2000)
+    for block in await page.query_selector_all("[data-qa='resume']"):
+        title_el = await block.query_selector("[data-qa='resume-title']")
+        if not title_el or title.lower() not in (await title_el.inner_text()).lower():
+            continue
+        for a in await block.query_selector_all("a[href*='/resume/']"):
+            m = re.search(r"/resume/([0-9a-f]{20,})", await a.get_attribute("href") or "")
+            if m:
+                _resume_id_cache[title] = m.group(1)
+                return m.group(1)
+    return None
+
+
+def get_profile(name: str | None = None) -> dict:
+    """Профиль по имени (для ручного запуска) или следующий по очереди."""
+    if name is None:
+        return next(_profile_cycle)
+    for profile in config.SEARCH_PROFILES:
+        if profile["name"] == name:
+            return profile
+    names = ", ".join(p["name"] for p in config.SEARCH_PROFILES)
+    raise ValueError(f"Неизвестный профиль поиска '{name}'. Доступны: {names}")
+
+
+async def run_responses(page, profile_name: str | None = None) -> dict:
     """
     Найти вакансии и откликнуться на подходящие.
     Возвращает {"sent": int, "skipped": int, "errors": int}
     """
     stats = {"sent": 0, "skipped": 0, "manual": 0, "errors": 0}
+    profile = get_profile(profile_name)
 
-    is_limited, blocked_until = database.get_rate_limit_status()
+    is_limited, blocked_until, block_reason = database.get_rate_limit_status()
     if is_limited:
-        logger.info(f"hh.ru лимит откликов активен до {blocked_until} UTC — пропускаю прогон")
+        logger.info(f"Блокировка активна до {blocked_until} UTC ({block_reason}) — пропускаю прогон")
         return stats
 
     today_count = database.count_today_responses()
@@ -28,15 +66,18 @@ async def run_responses(page) -> dict:
         )
         return stats
 
-    logger.info(f"Запуск задачи: отклики на вакансии ({today_count}/{config.DAILY_RESPONSE_CAP} за сегодня)")
+    logger.info(
+        f"Запуск задачи: отклики на вакансии, профиль «{profile['name']}» "
+        f"({today_count}/{config.DAILY_RESPONSE_CAP} за сегодня)"
+    )
 
     try:
-        vacancies = await _search_vacancies(page)
+        vacancies = await _search_vacancies(page, profile)
         if not vacancies:
             logger.info("Вакансии не найдены")
             return stats
 
-        filtered = _filter_vacancies(vacancies)
+        filtered = _filter_vacancies(vacancies, profile)
         logger.info(f"Найдено {len(vacancies)} вакансий, после фильтрации: {len(filtered)}")
 
         for vacancy in filtered:
@@ -54,7 +95,7 @@ async def run_responses(page) -> dict:
                 stats["skipped"] += 1
                 continue
 
-            result, reason = await _respond_to_vacancy(page, vacancy)
+            result, reason = await _respond_to_vacancy(page, vacancy, profile)
             if result == "sent":
                 database.save_response(vacancy)
                 logger.info(f"✅ Отклик: \"{vacancy['vacancy_title']}\" — {vacancy['company_name']}")
@@ -64,9 +105,17 @@ async def run_responses(page) -> dict:
                     config.MAX_DELAY_BETWEEN_RESPONSES,
                 )
             elif result == "limit_reached":
-                logger.warning(f"🛑 hh.ru сообщил об исчерпании лимита откликов — останавливаю прогон, откладываю на {config.RATE_LIMIT_BACKOFF_MINUTES} мин")
-                database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES)
+                minutes = config.CAPTCHA_BACKOFF_MINUTES if "капч" in (reason or "") else config.RATE_LIMIT_BACKOFF_MINUTES
+                logger.warning(f"🛑 {reason} — останавливаю прогон, откладываю на {minutes} мин")
+                database.set_rate_limited(minutes, reason)
                 break
+            elif result == "filtered":
+                # Помечаем как обработанную, чтобы не открывать эту вакансию повторно
+                database.save_manual_review(vacancy, reason)
+                database.mark_manual_review_handled(vacancy["vacancy_id"])
+                logger.info(f"⏭  Пропуск по описанию ({reason}): \"{vacancy['vacancy_title']}\" — {vacancy['company_name']}")
+                stats["skipped"] += 1
+                await human_delay.short_pause(4, 10)   # не листаем страницы вакансий подряд без пауз
             elif result == "manual":
                 database.save_manual_review(vacancy, reason)
                 logger.warning(f"✋ На ручную обработку (\"{reason}\"): \"{vacancy['vacancy_title']}\" — {vacancy['company_name']}")
@@ -81,18 +130,81 @@ async def run_responses(page) -> dict:
     return stats
 
 
-async def _search_vacancies(page) -> list[dict]:
+async def retry_manual_review(page, profile_name: str = "non_dev") -> dict:
+    """
+    Повторно прогнать вакансии из списка «На ручную обработку» (handled = 0).
+    Отправленные уходят из списка в отклики, у остальных обновляется причина.
+    """
+    stats = {"sent": 0, "skipped": 0, "manual": 0, "errors": 0}
+    profile = get_profile(profile_name)
+    rows = database.get_unhandled_manual_review()
+    logger.info(f"Повторный прогон ручных вакансий: {len(rows)} шт., профиль «{profile['name']}»")
+
+    for vacancy in rows:
+        title = f"\"{vacancy['vacancy_title']}\" — {vacancy['company_name']}"
+        if database.is_already_responded(vacancy["vacancy_id"]):
+            database.mark_manual_review_handled(vacancy["vacancy_id"])
+            stats["skipped"] += 1
+            continue
+
+        result, reason = await _respond_to_vacancy(page, vacancy, profile)
+        if result == "sent":
+            database.save_response(vacancy)
+            database.mark_manual_review_handled(vacancy["vacancy_id"])
+            logger.info(f"✅ Отклик (из ручных): {title}")
+            stats["sent"] += 1
+            await human_delay.pause(config.MIN_DELAY_BETWEEN_RESPONSES, config.MAX_DELAY_BETWEEN_RESPONSES)
+        elif result == "limit_reached":
+            minutes = config.CAPTCHA_BACKOFF_MINUTES if "капч" in (reason or "") else config.RATE_LIMIT_BACKOFF_MINUTES
+            logger.warning(f"🛑 {reason} — останавливаю повторный прогон, откладываю на {minutes} мин")
+            database.set_rate_limited(minutes, reason)
+            break
+        elif result == "filtered":
+            database.save_manual_review(vacancy, reason)
+            database.mark_manual_review_handled(vacancy["vacancy_id"])
+            logger.info(f"⏭  Пропуск по описанию ({reason}): {title}")
+            stats["skipped"] += 1
+            await human_delay.short_pause(4, 10)
+        elif result == "manual":
+            database.save_manual_review(vacancy, reason)
+            logger.warning(f"✋ Осталась на ручной обработке (\"{reason}\"): {title}")
+            stats["manual"] += 1
+            await human_delay.short_pause(8, 20)
+        else:
+            logger.warning(f"⚠️ Ошибка, вакансия остаётся в ручных ({reason}): {title}")
+            stats["errors"] += 1
+            await human_delay.short_pause(8, 20)
+
+    return stats
+
+
+async def _search_vacancies(page, profile: dict) -> list[dict]:
     """Открыть страницу поиска и собрать список вакансий по всем страницам выдачи."""
     all_vacancies: list[dict] = []
     seen_ids: set[str] = set()
 
-    for page_num in range(config.VACANCY_MAX_PAGES):
+    recommended_title = profile.get("recommended_for_resume")
+    resume_param: dict[str, str] = {}
+    if recommended_title:
+        resume_id = profile.get("resume_id") or await _resolve_resume_id(page, recommended_title)
+        if not resume_id:
+            logger.error(f"Не нашёл резюме «{recommended_title}» на hh.ru — рекомендации недоступны")
+            return []
+        resume_param = {"resume": resume_id}
+
+    for page_num in range(profile["max_pages"]):
+        params = {
+            "items_on_page": str(config.VACANCY_ITEMS_ON_PAGE),
+            "page": str(page_num),
+            **resume_param,
+        }
+        if not recommended_title:   # рекомендации hh.ru сам ограничивает по свежести
+            params["text"] = profile["search_text"]
+            params["search_period"] = str(config.VACANCY_SEARCH_PERIOD)
+        params.update(profile["extra_params"])      # work_format, order_by, свой search_period
         params = [
-            ("text", config.VACANCY_SEARCH_TEXT),
-            *[("search_field", f) for f in config.VACANCY_SEARCH_FIELD],
-            ("items_on_page", str(config.VACANCY_ITEMS_ON_PAGE)),
-            ("search_period", str(config.VACANCY_SEARCH_PERIOD)),
-            ("page", str(page_num)),
+            *params.items(),
+            *[("search_field", f) for f in profile["search_field"]],
         ]
         url = "https://hh.ru/search/vacancy?" + urllib.parse.urlencode(params)
 
@@ -100,8 +212,9 @@ async def _search_vacancies(page) -> list[dict]:
         await page.wait_for_timeout(2000)
 
         if await browser.is_ddos_challenge(page):
-            logger.warning("DDoS-Guard проверка браузера на странице поиска — откладываю попытки")
-            database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES)
+            reason = "DDoS-Guard проверка браузера на странице поиска"
+            logger.warning(f"{reason} — откладываю попытки")
+            database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES, reason)
             break
 
         await human_delay.scroll_naturally(page)
@@ -212,9 +325,18 @@ def _extract_id_from_url(url: str) -> str | None:
         return None
 
 
-def _filter_vacancies(vacancies: list[dict]) -> list[dict]:
-    """Отфильтровать вакансии по правилам из config."""
+def _title_has_keyword(title_lower: str, keyword: str, word_start: bool) -> bool:
+    kw = keyword.lower()
+    if not word_start:
+        return kw in title_lower
+    # Слово должно начинаться с kw: «qa» найдёт «QA-инженер», но не «aqua»
+    return re.search(rf"(?<!\w){re.escape(kw)}", title_lower) is not None
+
+
+def _filter_vacancies(vacancies: list[dict], profile: dict) -> list[dict]:
+    """Отфильтровать вакансии по правилам из config и профиля поиска."""
     result = []
+    dropped_by_whitelist: list[str] = []
     for v in vacancies:
         title_lower = v["vacancy_title"].lower()
         company_lower = v["company_name"].lower()
@@ -223,8 +345,17 @@ def _filter_vacancies(vacancies: list[dict]) -> list[dict]:
         if any(bl.lower() in company_lower for bl in config.COMPANIES_BLACKLIST):
             continue
 
-        # Черный список по должности
-        if any(kw.lower() in title_lower for kw in config.KEYWORDS_BLACKLIST):
+        # Черный список по должности (свой у каждого профиля)
+        if any(
+            _title_has_keyword(title_lower, kw, profile["title_word_start"])
+            for kw in profile["title_blacklist"]
+        ):
+            continue
+
+        # Белый список по должности (если задан в профиле): название должно содержать любое слово
+        whitelist = profile.get("title_whitelist")
+        if whitelist and not any(_title_has_keyword(title_lower, kw, True) for kw in whitelist):
+            dropped_by_whitelist.append(v["vacancy_title"])
             continue
 
         # Обязательные ключевые слова
@@ -233,10 +364,45 @@ def _filter_vacancies(vacancies: list[dict]) -> list[dict]:
                 continue
 
         result.append(v)
+    if dropped_by_whitelist:
+        sample = "; ".join(dropped_by_whitelist[:15])
+        logger.info(f"Не прошли белый список названий: {len(dropped_by_whitelist)}, например: {sample}")
     return result
 
 
-async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
+async def _select_resume(tab, resume_title: str) -> bool:
+    """
+    Если у аккаунта несколько резюме, в окне отклика есть карточка-выпадашка с выбранным резюме.
+    True — в карточке выбрано нужное резюме и список закрыт (кнопки окна не перекрыты).
+    """
+    try:
+        card = tab.locator("[role='button']:has([data-qa='resume-title'])").first
+        await card.wait_for(state="visible", timeout=5000)
+        current = card.locator("[data-qa='resume-title']").first
+        wanted = resume_title.lower()
+
+        # hh.ru запоминает последнее использованное резюме: если нужное уже выбрано —
+        # ничего не трогаем. Лишний клик раскрывает список, и он перекрывает кнопку «Откликнуться».
+        if wanted in (await current.inner_text()).lower():
+            return True
+
+        await card.click(timeout=5000)
+        option = tab.locator("[role='option']").filter(has_text=resume_title).first
+        await option.click(timeout=5000)
+
+        listbox = tab.locator("[role='listbox']")
+        for _ in range(10):
+            await tab.wait_for_timeout(300)
+            if wanted in (await current.inner_text()).lower() and not await listbox.count():
+                return True
+        logger.debug(f"_select_resume: резюме «{resume_title}» не выбралось или список не закрылся")
+        return False
+    except Exception as e:
+        logger.debug(f"_select_resume: не нашёл резюме «{resume_title}»: {e}")
+        return False
+
+
+async def _respond_to_vacancy(page, vacancy: dict, profile: dict) -> tuple[str, str | None]:
     """
     Открыть вакансию и откликнуться.
     Возвращает (status, reason), где status одно из:
@@ -271,6 +437,20 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
             logger.debug("DDoS-Guard прошла со второй попытки, продолжаю")
 
         await human_delay.scroll_naturally(new_tab)
+
+        # Отсев по описанию (профиль задаёт description_blacklist): строгий контроль присутствия, смены, продажи
+        flags = profile.get("description_blacklist")
+        if flags:
+            desc_el = await new_tab.query_selector("[data-qa='vacancy-description']")
+            desc = ((await desc_el.inner_text()) if desc_el else "").lower()
+            hit = next((f for f in flags if f in desc), None)
+            if hit:
+                return "filtered", f"В описании «{hit}»"
+
+        # Уже откликались (например, вручную на сайте) — повторно не отправляем
+        if await new_tab.query_selector("text=Вы откликнулись"):
+            logger.debug(f"На странице уже отмечен отклик: {clean_url}")
+            return "sent", None
 
         # Нажать кнопку "Откликнуться"
         respond_btn = await new_tab.query_selector("[data-qa='vacancy-response-link-top']")
@@ -316,8 +496,27 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
         # Если это произошло — выходим сейчас же, не трогая текстовые поля на странице
         # (иначе шаблон письма уйдёт как сообщение в уже открывшийся чат).
         if await _check_response_success(new_tab):
+            if profile["resume_title"]:
+                logger.warning(
+                    f"Отклик ушёл мгновенно, без выбора резюме «{profile['resume_title']}» — "
+                    f"проверьте, какое резюме использовано: {clean_url}"
+                )
             logger.debug("Отклик отправлен мгновенно (без формы письма)")
             return "sent", None
+
+        # Профиль привязан к конкретному резюме — выбираем его. Если выбрать не удалось,
+        # не отправляем (иначе уйдёт не то резюме) и отдаём вакансию на ручную обработку.
+        if profile["resume_title"] and not await _select_resume(new_tab, profile["resume_title"]):
+            reason = f"Не удалось выбрать резюме «{profile['resume_title']}» в окне отклика"
+            logger.warning(f"{reason}: {clean_url}")
+            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_resume_choice")
+            return "manual", reason
+
+        # В новом окне отклика поле письма скрыто за кнопкой «Добавить сопроводительное»
+        add_letter_btn = await new_tab.query_selector("[data-qa='add-cover-letter']")
+        if add_letter_btn:
+            await add_letter_btn.click(timeout=5000)
+            await new_tab.wait_for_timeout(700)
 
         # Если появилось поле сопроводительного письма
         cover_input = await new_tab.query_selector("[data-qa='vacancy-response-popup-form-letter-input']")
@@ -336,12 +535,14 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
                 return "limit_reached", reason
 
             await cover_input.click(force=True)
-            for char in config.COVER_LETTER_TEMPLATE:
+            for char in profile["cover_letter"]:
                 await cover_input.type(char, delay=random_char_delay())
             await asyncio.sleep(0.5)
 
         # Нажать "Отправить отклик"
-        submit_btn = await new_tab.query_selector("[data-qa='vacancy-response-letter-submit']")
+        submit_btn = await new_tab.query_selector("[data-qa='vacancy-response-submit-popup']")
+        if not submit_btn:
+            submit_btn = await new_tab.query_selector("[data-qa='vacancy-response-letter-submit']")
         if not submit_btn:
             submit_btn = await new_tab.query_selector("button[data-qa*='submit']")
         if not submit_btn:
@@ -363,21 +564,38 @@ async def _respond_to_vacancy(page, vacancy: dict) -> tuple[str, str | None]:
             await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_submit")
             return "manual", reason
 
-        await submit_btn.click(force=True, timeout=60000)
-        await new_tab.wait_for_timeout(2000)
+        # Без force: если кнопку что-то перекрывает, клик упадёт с ошибкой (вакансия уйдёт
+        # на повтор в следующем прогоне), а не попадёт молча в перекрывающий элемент
+        await submit_btn.click(timeout=15000)
 
-        # Проверить подтверждение
-        success = await _check_response_success(new_tab)
-        if success:
-            return "sent", None
+        # Исход появляется не мгновенно (подтверждение, анкета, капча) — ждём его, а не фиксированную паузу
+        for _ in range(20):
+            await new_tab.wait_for_timeout(500)
 
-        if await _check_rate_limited(new_tab):
-            reason = "hh.ru: лимит откликов исчерпан (не более 200 за 24 часа)"
-            logger.warning(f"{reason}: {clean_url}")
-            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
-            return "limit_reached", reason
+            if await _check_response_success(new_tab):
+                return "sent", None
 
-        reason = "Отклик отправлен, но подтверждение не найдено (возможно, доп. вопросы работодателя)"
+            if await _check_rate_limited(new_tab):
+                reason = "hh.ru: лимит откликов исчерпан (не более 200 за 24 часа)"
+                logger.warning(f"{reason}: {clean_url}")
+                await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "rate_limit")
+                return "limit_reached", reason
+
+            # hh.ru требует капчу — это признак подозрения на автоматизацию: не решаем её и не долбим сайт,
+            # а откладываем попытки (вакансия не попадает в ручную обработку, она ещё не отправлена)
+            if await new_tab.query_selector("text=Пройдите капчу"):
+                reason = "hh.ru просит капчу"
+                logger.warning(f"{reason}: {clean_url}")
+                await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "captcha")
+                return "limit_reached", reason
+
+            if await new_tab.query_selector("textarea[placeholder='Писать тут']"):
+                reason = "Анкета работодателя: нужны ответы на вопросы (бот их не заполняет)"
+                logger.warning(f"{reason}: {clean_url}")
+                await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "questionnaire")
+                return "manual", reason
+
+        reason = "Кнопка отправки нажата, но подтверждение отклика не найдено"
         logger.warning(f"{reason}: {clean_url}")
         await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_confirmation")
         return "manual", reason
