@@ -15,9 +15,9 @@ async def publish_resume(page) -> dict:
     """
     stats = {"raised": 0, "skipped": 0, "errors": 0}
 
-    is_limited, blocked_until = database.get_rate_limit_status()
+    is_limited, blocked_until, block_reason = database.get_rate_limit_status()
     if is_limited:
-        logger.info(f"hh.ru блокировка активна до {blocked_until} UTC — пропускаю поднятие резюме")
+        logger.info(f"Блокировка активна до {blocked_until} UTC ({block_reason}) — пропускаю поднятие резюме")
         return stats
 
     try:
@@ -26,8 +26,9 @@ async def publish_resume(page) -> dict:
         await page.wait_for_timeout(2000)
 
         if await browser.is_ddos_challenge(page):
-            logger.warning("DDoS-Guard проверка браузера на странице резюме — откладываю попытки")
-            database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES)
+            reason = "DDoS-Guard проверка браузера на странице резюме"
+            logger.warning(f"{reason} — откладываю попытки")
+            database.set_rate_limited(config.RATE_LIMIT_BACKOFF_MINUTES, reason)
             await save_error_screenshot(page, "resume_ddos_guard")
             return stats
 

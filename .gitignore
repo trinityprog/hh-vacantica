@@ -5,3 +5,5 @@ logs/*.log
 logs/screenshots/
 __pycache__/
 *.pyc
+raw_cookies.json
+session/state.json.bak*

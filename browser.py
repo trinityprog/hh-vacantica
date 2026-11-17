@@ -38,12 +38,14 @@ async def save_session(page: Page):
     logger.info(f"Сессия сохранена: {config.SESSION_PATH}")
 
 
-async def load_session() -> tuple[Browser, BrowserContext]:
+async def load_session(headless: bool | None = None) -> tuple[Browser, BrowserContext]:
     global _playwright, _browser, _context
     if _playwright is None:
         await start_playwright()
 
-    _browser = await _playwright.chromium.launch(headless=config.HEADLESS)
+    _browser = await _playwright.chromium.launch(
+        headless=config.HEADLESS if headless is None else headless
+    )
 
     if os.path.exists(config.SESSION_PATH):
         logger.info("Загружаю сохранённую сессию")

@@ -42,7 +42,7 @@ COMPANIES_BLACKLIST: list[str] = ["сбер", "sber", "т-банк", "тиньк
 MAX_RESPONSES_PER_RUN = 1
 DAILY_RESPONSE_CAP = 200
 RATE_LIMIT_BACKOFF_MINUTES = 60  # пауза после сообщения hh.ru "исчерпали лимит откликов"
-CAPTCHA_BACKOFF_MINUTES = 10    # пауза после капчи hh.ru (бот её не решает)
+CAPTCHA_BACKOFF_MINUTES = 7     # пауза после капчи hh.ru (бот её не решает)
 
 # --- Безопасность ---
 MIN_DELAY_BETWEEN_RESPONSES = 30

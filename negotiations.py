@@ -23,9 +23,9 @@ async def sync_statuses(page) -> dict:
     """
     stats = {"updated": 0, "pages": 0}
 
-    is_limited, blocked_until = database.get_rate_limit_status()
+    is_limited, blocked_until, block_reason = database.get_rate_limit_status()
     if is_limited:
-        logger.info(f"hh.ru блокировка активна до {blocked_until} UTC — пропускаю синхронизацию статусов")
+        logger.info(f"Блокировка активна до {blocked_until} UTC ({block_reason}) — пропускаю синхронизацию статусов")
         return stats
 
     try:
@@ -100,9 +100,9 @@ async def sync_unread_chats(page) -> dict:
     """
     stats = {"unread": 0, "matched": 0}
 
-    is_limited, blocked_until = database.get_rate_limit_status()
+    is_limited, blocked_until, block_reason = database.get_rate_limit_status()
     if is_limited:
-        logger.info(f"hh.ru блокировка активна до {blocked_until} UTC — пропускаю синхронизацию чатов")
+        logger.info(f"Блокировка активна до {blocked_until} UTC ({block_reason}) — пропускаю синхронизацию чатов")
         return stats
 
     try:

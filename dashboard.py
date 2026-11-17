@@ -71,6 +71,8 @@ HTML = """<!DOCTYPE html>
   .pager button:not(:disabled):hover { background: #2d3148; }
   td button { background: #1e2235; border: 1px solid #2d3148; color: #cbd5e1; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
   td button:hover { background: #2d3148; }
+  .toolbar-btn { background: #1e2235; border: 1px solid #2d3148; color: #cbd5e1; border-radius: 8px; padding: 7px 12px; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+  .toolbar-btn:hover { background: #2d3148; }
 </style>
 </head>
 <body>
@@ -105,7 +107,11 @@ HTML = """<!DOCTYPE html>
   </div>
   <div class="panel" style="margin-bottom:16px">
     <div class="panel-header">На ручную обработку</div>
-    <div class="panel-toolbar"><input class="panel-search" id="manual-search" placeholder="Поиск по вакансии/компании/причине…"></div>
+    <div class="panel-toolbar" style="display:flex;gap:8px;align-items:center">
+      <input class="panel-search" id="manual-search" placeholder="Поиск по вакансии/компании/причине…" style="flex:1">
+      <button class="toolbar-btn" onclick="openManualFive()">Открыть 5</button>
+      <button class="toolbar-btn" onclick="handleManualFive()">Отправить в обработано</button>
+    </div>
     <div id="manual-review-table"></div>
     <div class="pager" id="manual-pager"></div>
   </div>
@@ -160,6 +166,10 @@ const panels = {
 const tableIds = { responses: 'responses-table', publishes: 'publishes-table', manual: 'manual-review-table' };
 const pagerIds = { responses: 'responses-pager', publishes: 'publishes-pager', manual: 'manual-pager' };
 
+let manualRows = [];
+let manualOpenedIds = new Set();
+let manualLastOpened = [];
+
 function statusBadge(status) {
   const map = {
     'Собеседование': '#22c55e',
@@ -197,7 +207,7 @@ function renderPublishes(rows) {
 function renderManual(rows) {
   if (rows.length === 0) return '<div class="empty">Ничего не найдено</div>';
   const trs = rows.map(m => `
-    <tr>
+    <tr style="${manualOpenedIds.has(m.vacancy_id) ? 'background:#3b82f608' : ''}">
       <td><a href="${m.vacancy_url}" target="_blank">${m.vacancy_title}</a><br><span class="time">${m.company_name}</span></td>
       <td style="font-size:12px">${m.reason}</td>
       <td><span class="time">${timeAgo(m.created_at)}</span></td>
@@ -208,6 +218,28 @@ function renderManual(rows) {
 
 async function markHandled(vacancyId) {
   await fetch(`/api/manual_review/${encodeURIComponent(vacancyId)}/handle`, { method: 'POST' });
+  manualOpenedIds.delete(vacancyId);
+  manualLastOpened = manualLastOpened.filter(id => id !== vacancyId);
+  await loadPanel('manual');
+}
+
+function openManualFive() {
+  const targets = manualRows.slice(0, 5);
+  if (targets.length === 0) return;
+  targets.forEach(m => {
+    window.open(m.vacancy_url, '_blank');
+    manualOpenedIds.add(m.vacancy_id);
+  });
+  manualLastOpened = targets.map(m => m.vacancy_id);
+  document.getElementById(tableIds.manual).innerHTML = renderManual(manualRows);
+}
+
+async function handleManualFive() {
+  const ids = manualLastOpened.length > 0 ? manualLastOpened : manualRows.slice(0, 5).map(m => m.vacancy_id);
+  if (ids.length === 0) return;
+  await Promise.all(ids.map(id => fetch(`/api/manual_review/${encodeURIComponent(id)}/handle`, { method: 'POST' })));
+  ids.forEach(id => manualOpenedIds.delete(id));
+  manualLastOpened = [];
   await loadPanel('manual');
 }
 
@@ -219,6 +251,7 @@ async function loadPanel(name) {
   const data = await fetch(url).then(r => r.json());
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
   if (st.page > pages) { st.page = pages; return loadPanel(name); }
+  if (name === 'manual') manualRows = data.rows;
   document.getElementById(tableIds[name]).innerHTML = renderers[name](data.rows);
   document.getElementById(pagerIds[name]).innerHTML = `
     <span>${data.total} записей · стр. ${st.page}/${pages}</span>
