@@ -437,6 +437,12 @@ async def _respond_to_vacancy(page, vacancy: dict, profile: dict) -> tuple[str, 
 
             logger.debug("DDoS-Guard прошла со второй попытки, продолжаю")
 
+        # Вакансия снята/в архиве/скрыта: hh.ru показывает «Вам недоступна эта вакансия»
+        # (с формой входа) вместо страницы. Откликаться некуда — ручная обработка не поможет.
+        for gone_sel in ("text=Вам недоступна эта вакансия", "text=Вакансия в архиве"):
+            if await new_tab.query_selector(gone_sel):
+                return "filtered", "Вакансия недоступна (снята или в архиве)"
+
         await human_delay.scroll_naturally(new_tab)
 
         # Отсев по описанию (профиль задаёт description_blacklist): строгий контроль присутствия, смены, продажи
