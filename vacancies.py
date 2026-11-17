@@ -1,4 +1,5 @@
 import asyncio
+import os
 import itertools
 import re
 import urllib.parse
@@ -8,7 +9,7 @@ import browser
 import config
 import database
 import human_delay
-from logger import logger, save_error_screenshot
+from logger import LOG_DIR, logger, save_error_screenshot
 
 # Профили поиска чередуются от прогона к прогону (см. config.SEARCH_PROFILES)
 _profile_cycle = itertools.cycle(
@@ -512,6 +513,15 @@ async def _respond_to_vacancy(page, vacancy: dict, profile: dict) -> tuple[str, 
             await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_resume_choice")
             return "manual", reason
 
+        # Анкета работодателя (вопросы с полями «Писать тут» / Да-Нет): бот её не заполняет.
+        # Проверяем до нажатия отправки — иначе submit по пустой форме только подсвечивает
+        # обязательные поля красным, а вакансия уходит в ручные с непонятной причиной.
+        if await _has_employer_questionnaire(new_tab):
+            reason = "Анкета работодателя: нужны ответы на вопросы (бот их не заполняет)"
+            logger.warning(f"{reason}: {clean_url}")
+            await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "questionnaire")
+            return "manual", reason
+
         # В новом окне отклика поле письма скрыто за кнопкой «Добавить сопроводительное»
         add_letter_btn = await new_tab.query_selector("[data-qa='add-cover-letter']")
         if add_letter_btn:
@@ -589,7 +599,7 @@ async def _respond_to_vacancy(page, vacancy: dict, profile: dict) -> tuple[str, 
                 await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "captcha")
                 return "limit_reached", reason
 
-            if await new_tab.query_selector("textarea[placeholder='Писать тут']"):
+            if await _has_employer_questionnaire(new_tab):
                 reason = "Анкета работодателя: нужны ответы на вопросы (бот их не заполняет)"
                 logger.warning(f"{reason}: {clean_url}")
                 await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "questionnaire")
@@ -598,6 +608,7 @@ async def _respond_to_vacancy(page, vacancy: dict, profile: dict) -> tuple[str, 
         reason = "Кнопка отправки нажата, но подтверждение отклика не найдено"
         logger.warning(f"{reason}: {clean_url}")
         await _save_review_screenshot(new_tab, vacancy["vacancy_id"], "no_confirmation")
+        await _save_review_html(new_tab, vacancy["vacancy_id"], "no_confirmation")
         return "manual", reason
 
     except Exception as e:
@@ -610,6 +621,46 @@ async def _respond_to_vacancy(page, vacancy: dict, profile: dict) -> tuple[str, 
 
 async def _save_review_screenshot(page, vacancy_id: str, tag: str) -> None:
     await save_error_screenshot(page, f"manual_review_{tag}_{vacancy_id}")
+
+
+async def _save_review_html(page, vacancy_id: str, tag: str) -> None:
+    """HTML страницы рядом со скриншотом — чтобы непонятный случай можно было разобрать по DOM."""
+    try:
+        path = os.path.join(LOG_DIR, "screenshots", f"manual_review_{tag}_{vacancy_id}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(await page.content())
+        logger.debug(f"HTML сохранён: {path}")
+    except Exception as e:
+        logger.debug(f"_save_review_html: не удалось сохранить HTML: {e}")
+
+
+async def _has_employer_questionnaire(page) -> bool:
+    """
+    Есть ли в окне отклика анкета работодателя. В новой вёрстке hh.ru подсказка «Писать тут»
+    рисуется отдельным элементом, а не атрибутом placeholder, поэтому проверяем и текст,
+    и сам атрибут, и любые textarea, кроме поля сопроводительного письма.
+    """
+    selectors = [
+        "text=Писать тут",
+        "textarea[placeholder='Писать тут']",
+    ]
+    for sel in selectors:
+        try:
+            if await page.query_selector(sel):
+                return True
+        except Exception:
+            continue
+    try:
+        for ta in await page.query_selector_all("textarea"):
+            qa = (await ta.get_attribute("data-qa")) or ""
+            placeholder = (await ta.get_attribute("placeholder")) or ""
+            if "letter" in qa or "письм" in placeholder.lower():
+                continue
+            if await ta.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
 
 
 async def _check_rate_limited(page) -> bool:
