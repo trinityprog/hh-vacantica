@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 raw_cookies.json
 session/state.json.bak*
+.venv/
+.DS_Store
